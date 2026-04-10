@@ -1,0 +1,241 @@
+name: PREDATOR 2026 — CI
+
+# SCRUM-20 | Phase 0 | Spec §15.2
+# Per-PR checks: Rust (clippy+rustfmt), Python (ruff+mypy+black),
+# unit tests (90% coverage gate), integration tests, latency regression,
+# SAST (semgrep+CodeQL), dependency scanning, model reproducibility
+
+on:
+  pull_request:
+    branches: [main, 'release/*']
+  push:
+    branches: [main]
+
+env:
+  RUST_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+  PYTHON_VERSION: "3.11"
+  LATENCY_REGRESSION_THRESHOLD_US: "20"   # 20 μs — any regression blocks merge
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Rust: clippy + rustfmt + unit tests + 90% coverage
+  # ---------------------------------------------------------------------------
+  rust-checks:
+    name: Rust — clippy / fmt / tests / coverage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt check
+        run: cargo fmt --all -- --check
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all --no-fail-fast
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Coverage (tarpaulin ≥ 90%)
+        run: |
+          cargo install cargo-tarpaulin --quiet
+          cargo tarpaulin --all --timeout 120 --out Xml --fail-under 90
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: cobertura.xml
+
+  # ---------------------------------------------------------------------------
+  # 2. Python: ruff + mypy --strict + black + unit tests
+  # ---------------------------------------------------------------------------
+  python-checks:
+    name: Python — ruff / mypy / black / pytest
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python deps
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff lint
+        run: ruff check src/ training/ tests/
+
+      - name: black format check
+        run: black --check src/ training/ tests/
+
+      - name: mypy --strict
+        run: mypy --strict src/ training/
+
+      - name: pytest (Python unit tests)
+        run: pytest tests/unit/ -v --tb=short --cov=src --cov-fail-under=90
+
+  # ---------------------------------------------------------------------------
+  # 3. Integration tests (mock exchange)
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    name: Integration tests — mock exchange
+    runs-on: ubuntu-22.04
+    needs: [rust-checks, python-checks]
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build integration test binary
+        run: cargo build --tests --release
+      - name: Run integration tests (mock exchange)
+        run: cargo test --test integration -- --test-threads=1
+        env:
+          PREDATOR_ENV: test
+          PREDATOR_MOCK_EXCHANGE: "1"
+          REDIS_URL: redis://localhost:6379
+
+  # ---------------------------------------------------------------------------
+  # 4. Latency regression gate (20 μs threshold — Spec §15.2)
+  # ---------------------------------------------------------------------------
+  latency-regression:
+    name: Latency regression — p99 ≤ threshold
+    runs-on: ubuntu-22.04
+    needs: [rust-checks]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release
+      - name: Run latency microbenchmark
+        run: |
+          cargo bench --bench latency_regression -- --output-format bencher \
+            | tee bench_results.txt
+      - name: Check regression threshold
+        run: |
+          python3 scripts/check_latency_regression.py \
+            --results bench_results.txt \
+            --threshold-us ${{ env.LATENCY_REGRESSION_THRESHOLD_US }}
+
+  # ---------------------------------------------------------------------------
+  # 5. SAST — semgrep + CodeQL
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST — semgrep + CodeQL
+    runs-on: ubuntu-22.04
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Semgrep scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/rust
+            p/python
+            p/owasp-top-ten
+            p/secrets
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Autobuild (Python)
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # ---------------------------------------------------------------------------
+  # 6. Dependency scanning — cargo-audit + pip-audit
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    name: Dependency audit — cargo + pip
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit --deny warnings
+
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --strict
+
+  # ---------------------------------------------------------------------------
+  # 7. Policy-as-code gate — risk invariants (OPA/Rego)
+  # ---------------------------------------------------------------------------
+  policy-gates:
+    name: Policy-as-code — risk invariants
+    runs-on: ubuntu-22.04
+    needs: [rust-checks, python-checks]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OPA
+        run: |
+          curl -L -o /usr/local/bin/opa \
+            https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x /usr/local/bin/opa
+      - name: Run policy gates
+        run: |
+          opa test infra/policy_gates/ -v
+          opa eval --data infra/policy_gates/ \
+            --input config/predator_config.json \
+            'data.predator.risk.invariants_pass' | grep '"result": true'
+
+  # ---------------------------------------------------------------------------
+  # 8. Model reproducibility check (only on model-change PRs)
+  # ---------------------------------------------------------------------------
+  model-reproducibility:
+    name: Model reproducibility (bit-identical on same HW)
+    runs-on: ubuntu-22.04
+    if: contains(github.event.pull_request.labels.*.name, 'model-change')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install deps
+        run: pip install -r requirements-dev.txt
+      - name: Run reproducibility test
+        run: |
+          # Disable TF32 (FIXED A3: use_deterministic_algorithms required)
+          CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+          python3 -m pytest tests/reproducibility/ -v
+
+  # ---------------------------------------------------------------------------
+  # Required status checks (must all pass to merge to main)
+  # ---------------------------------------------------------------------------
+  # Branch protection rules enforce: ALL of the above must be green.
+  # No direct pushes to main. Requires ML Lead + Platform Lead + Compliance review.
+  # (Configured in GitHub Settings → Branches → Protection Rules)

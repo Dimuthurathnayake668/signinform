@@ -1,0 +1,28 @@
+# PREDATOR 2026 — GRUB configuration reference
+# SCRUM-15 | Phase 0 | Spec §3.2
+#
+# Apply by copying relevant line to /etc/default/grub GRUB_CMDLINE_LINUX
+# then running: sudo update-grub && sudo reboot
+#
+# Full boot parameter line (add to GRUB_CMDLINE_LINUX):
+#
+#   isolcpus=0-15 nohz_full=0-15 rcu_nocbs=0-15 intel_pstate=disable mitigations=off
+#
+# Parameter explanations:
+#   isolcpus=0-15         — Remove cores 0-15 from kernel scheduler (hot path only)
+#   nohz_full=0-15        — Disable timer tick on isolated cores (reduces jitter ~1-2μs)
+#   rcu_nocbs=0-15        — Move RCU callbacks off isolated cores
+#   intel_pstate=disable  — Use acpi-cpufreq for manual frequency control (performance mode)
+#   mitigations=off       — Disable Spectre/Meltdown mitigations (trusted co-lo environment only)
+#
+# After reboot, verify:
+#   cat /proc/cmdline | grep isolcpus     → should contain "isolcpus=0-15"
+#   ls /sys/devices/system/cpu/isolated  → should show "0-15"
+#
+# CPU frequency: set all cores to max performance after each boot
+#   for cpu in /sys/devices/system/cpu/cpu{0..95}/cpufreq/scaling_governor; do
+#       echo performance > $cpu 2>/dev/null || true; done
+#
+# Verify isolation under stress:
+#   taskset -c 16-95 stress-ng --cpu 79 --timeout 30 &
+#   perf stat -e cs -C 0-15 sleep 10    → context-switches should be near 0

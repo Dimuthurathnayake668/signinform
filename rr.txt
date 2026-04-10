@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "mcp-atlassian": {
+      "command": "uvx",
+      "args": ["mcp-atlassian"],
+      "env": {
+        "JIRA_URL": "https://dimuthurathna668.atlassian.net",
+        "JIRA_USERNAME": "dimuthurathna668@gmail.com",
+        "JIRA_API_TOKEN": "${JIRA_API_TOKEN}"
+      }
+    }
+  }
+}

@@ -1,0 +1,280 @@
+name: PREDATOR 2026 — CD
+
+# SCRUM-20 | Phase 0 | Spec §15.3–15.4
+# Merge-to-main pipeline:
+#   build-release → simulation-validation (1h) → paper-trading-gate
+#   → shadow-deploy (2 manual approvals: ML Lead + Risk Officer)
+# Emergency rollback: enforced as separate workflow dispatch trigger
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Deployment action"
+        type: choice
+        options:
+          - deploy
+          - emergency-rollback
+        required: true
+        default: deploy
+      rollback_reason:
+        description: "Rollback reason (required if action=emergency-rollback)"
+        type: string
+        required: false
+      operator:
+        description: "Operator username for audit log"
+        type: string
+        required: true
+
+env:
+  RUST_TOOLCHAIN: stable
+  SIMULATION_DURATION_SECONDS: 3600     # 1h mandatory simulation §15.3
+  PAPER_TRADING_DURATION_SECONDS: 1800  # 30min paper-trading gate
+  MAX_PAPER_TRADING_DRAWDOWN_BPS: 50    # reject if drawdown > 0.5%
+  MAX_LATENCY_P99_US: 20                # hard latency SLO §15.2
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # GUARD: route emergency-rollback immediately, skip normal pipeline
+  # ---------------------------------------------------------------------------
+  route:
+    name: Route action
+    runs-on: ubuntu-22.04
+    outputs:
+      is_rollback: ${{ steps.check.outputs.is_rollback }}
+    steps:
+      - id: check
+        run: |
+          if [[ "${{ github.event.inputs.action }}" == "emergency-rollback" ]]; then
+            echo "is_rollback=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_rollback=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # EMERGENCY ROLLBACK (non-interactive, immediate — Spec §15.4)
+  # ---------------------------------------------------------------------------
+  emergency-rollback:
+    name: Emergency rollback
+    runs-on: ubuntu-22.04
+    needs: route
+    if: needs.route.outputs.is_rollback == 'true'
+    environment: production-rollback
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate rollback inputs
+        run: |
+          if [[ -z "${{ github.event.inputs.rollback_reason }}" ]]; then
+            echo "::error::rollback_reason is required for emergency rollback"
+            exit 1
+          fi
+
+      - name: Execute emergency rollback
+        run: |
+          # Authenticated via GitHub OIDC — no static secrets in env
+          ./scripts/emergency_rollback.sh \
+            --reason "${{ github.event.inputs.rollback_reason }}" \
+            --operator "${{ github.event.inputs.operator }}" \
+            --env production
+        env:
+          VAULT_ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}
+          VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+
+      - name: Write safety event to ClickHouse audit log
+        run: |
+          python3 scripts/write_safety_event.py \
+            --event-type EMERGENCY_ROLLBACK \
+            --reason "${{ github.event.inputs.rollback_reason }}" \
+            --operator "${{ github.event.inputs.operator }}" \
+            --severity CRITICAL
+
+      - name: PagerDuty CRITICAL alert
+        run: |
+          curl -s -X POST https://events.pagerduty.com/v2/enqueue \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"routing_key\": \"${{ secrets.PAGERDUTY_ROUTING_KEY }}\",
+              \"event_action\": \"trigger\",
+              \"payload\": {
+                \"summary\":  \"PREDATOR EMERGENCY ROLLBACK: ${{ github.event.inputs.rollback_reason }}\",
+                \"severity\": \"critical\",
+                \"source\":   \"cd-pipeline\",
+                \"custom_details\": {
+                  \"operator\": \"${{ github.event.inputs.operator }}\",
+                  \"commit\":  \"${{ github.sha }}\"
+                }
+              }
+            }"
+
+  # ---------------------------------------------------------------------------
+  # 1. Build release binary (deterministic, cache-busted by Cargo.lock hash)
+  # ---------------------------------------------------------------------------
+  build-release:
+    name: Build release
+    runs-on: ubuntu-22.04
+    needs: route
+    if: needs.route.outputs.is_rollback == 'false'
+    outputs:
+      artifact_sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release (stripped, no debug info in prod)
+        run: |
+          cargo build --release --locked
+          strip target/release/predator
+
+      - name: Compute artifact hash
+        id: hash
+        run: |
+          SHA=$(sha256sum target/release/predator | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Binary SHA256: $SHA"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: predator-release
+          path: target/release/predator
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. Simulation validation — 1h mandatory run (Spec §15.3)
+  # ---------------------------------------------------------------------------
+  simulation-validation:
+    name: Simulation validation (1h)
+    runs-on: ubuntu-22.04
+    needs: build-release
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: predator-release
+          path: target/release/
+
+      - name: Make binary executable
+        run: chmod +x target/release/predator
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install simulation deps
+        run: pip install -r requirements-simulation.txt
+
+      - name: Run 1h simulation
+        run: |
+          python3 scripts/run_simulation.py \
+            --binary target/release/predator \
+            --duration ${{ env.SIMULATION_DURATION_SECONDS }} \
+            --output simulation_results.json
+        env:
+          PREDATOR_ENV: simulation
+
+      - name: Validate simulation results
+        run: |
+          python3 scripts/validate_simulation.py \
+            --results simulation_results.json \
+            --max-latency-p99-us ${{ env.MAX_LATENCY_P99_US }} \
+            --allow-drawdown-bps 200
+
+      - name: Upload simulation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation-results
+          path: simulation_results.json
+
+  # ---------------------------------------------------------------------------
+  # 3. Paper trading gate
+  # ---------------------------------------------------------------------------
+  paper-trading-gate:
+    name: Paper trading gate
+    runs-on: ubuntu-22.04
+    needs: simulation-validation
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: predator-release
+          path: target/release/
+
+      - name: chmod binary
+        run: chmod +x target/release/predator
+
+      - name: Run paper trading
+        run: |
+          python3 scripts/run_paper_trading.py \
+            --binary target/release/predator \
+            --duration ${{ env.PAPER_TRADING_DURATION_SECONDS }} \
+            --output paper_trading_results.json
+        env:
+          PREDATOR_ENV: paper
+
+      - name: Gate on drawdown
+        run: |
+          python3 scripts/check_drawdown.py \
+            --results paper_trading_results.json \
+            --max-drawdown-bps ${{ env.MAX_PAPER_TRADING_DRAWDOWN_BPS }}
+
+  # ---------------------------------------------------------------------------
+  # 4. Shadow deploy — requires 2 manual approvals (Spec §15.3)
+  #    Approvals: ML Lead  +  Risk Officer
+  # ---------------------------------------------------------------------------
+  shadow-deploy:
+    name: Shadow deploy (2 approvals required)
+    runs-on: ubuntu-22.04
+    needs: paper-trading-gate
+    environment: shadow-production   # GitHub environment with required reviewers
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: predator-release
+          path: target/release/
+
+      - name: chmod binary
+        run: chmod +x target/release/predator
+
+      - name: Deploy to shadow
+        run: |
+          ./scripts/deploy_shadow.sh \
+            --binary target/release/predator \
+            --sha "${{ needs.build-release.outputs.artifact_sha256 }}"
+        env:
+          VAULT_ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}
+          VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+
+      - name: Save deployment record
+        run: |
+          python3 scripts/write_safety_event.py \
+            --event-type SHADOW_DEPLOY \
+            --sha "${{ needs.build-release.outputs.artifact_sha256 }}" \
+            --commit "${{ github.sha }}" \
+            --operator "cd-pipeline" \
+            --severity INFO
+
+  # ---------------------------------------------------------------------------
+  # Release protection: no merge without CI gate passing
+  # (Enforced via GitHub branch protection — see CONTRIBUTING.md §4)
+  # ---------------------------------------------------------------------------

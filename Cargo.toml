@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/predator-core",
+    "crates/predator-ingestion",
+    "crates/predator-features",
+    "crates/predator-inference",
+    "crates/predator-order",
+    "crates/predator-risk",
+    "crates/predator-audit",
+    "crates/predator-hsm",
+]
+
+[workspace.package]
+edition     = "2021"
+rust-version = "1.78"
+authors     = ["PREDATOR Platform Team"]
+license     = "UNLICENSED"
+
+# ── Workspace-wide dependency versions (update in one place) ───────────────
+[workspace.dependencies]
+# Async runtime
+tokio        = { version = "1.37", features = ["full"] }
+
+# Serialization
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+
+# Redis (feature store / ICV)
+fred         = { version = "9.0", features = ["pool", "sentinel"] }
+
+# Kafka (audit stream)
+rdkafka      = { version = "0.36", features = ["ssl", "sasl"] }
+
+# ClickHouse (audit + feature persistence)
+clickhouse   = { version = "0.12", features = ["inserter"] }
+
+# Logging / tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics (Prometheus)
+prometheus       = "0.13"
+lazy_static      = "1.4"
+
+# Time
+libc     = "0.2"
+chrono   = { version = "0.4", features = ["serde"] }
+
+# GPU FFI
+# NOTE: cuda-sys is not pulled from crates.io — we vendor CUDA FFI in src/cuda_ffi.rs
+# using raw extern "C" declarations. No third-party GPU crate on hot path.
+
+# HashiCorp Vault AppRole client
+vaultrs  = "0.7"
+
+# PKCS#11 (Thales Luna HSM — CKM_EDDSA Ed25519 only, Spec §16)
+# Raw FFI to libCryptoki2_64.so — no high-level wrapper (≤5μs budget requires direct C calls)
+libloading = "0.8"
+
+# Error handling
+thiserror  = "1.0"
+anyhow     = "1.0"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ── Profile: release (production — max perf, matches latency SLO §15.2) ──
+[profile.release]
+opt-level       = 3
+lto             = "fat"        # Full LTO: reduces binary size + enables cross-crate inlining
+codegen-units   = 1            # Required with fat LTO; prevents codegen fragmentation
+panic           = "abort"      # No unwinding on hot path — saves stack unwinding overhead
+strip           = "symbols"    # Strip debug symbols from release binary
+debug           = false
+overflow-checks = false        # Checked in debug/test; disabled for hot-path throughput
+
+# ── Profile: bench (latency microbenchmarks) ──────────────────────────────
+[profile.bench]
+inherits  = "release"
+debug     = true               # Keep symbols for flamegraphs / perf annotation
+strip     = "none"
+
+# ── Profile: dev ──────────────────────────────────────────────────────────
+[profile.dev]
+opt-level       = 1            # Faster compile than opt=0; avoids absurd debug slowness
+overflow-checks = true
+debug           = true
+
+# ── Profile: test ─────────────────────────────────────────────────────────
+[profile.test]
+opt-level       = 1
+overflow-checks = true

@@ -1,0 +1,12 @@
+[package]
+name        = "predator-core"
+version     = "0.1.0"
+edition     = "2021"
+description = "PREDATOR 2026 — Core types, GPU FFI, timestamp, HSM client"
+
+[dependencies]
+libc      = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }

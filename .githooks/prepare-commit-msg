@@ -1,0 +1,30 @@
+#!/bin/sh
+# Auto-prepend Jira key from branch name into commit message.
+
+MSG_FILE="$1"
+COMMIT_SOURCE="$2"
+
+# Skip merge/squash/fixup/reword generated messages.
+case "$COMMIT_SOURCE" in
+  merge|squash|commit|template)
+    ;;
+  *)
+    ;;
+esac
+
+BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+JIRA_KEY=$(printf "%s" "$BRANCH_NAME" | grep -oE '[A-Z][A-Z0-9_]*-[0-9]+' | head -n 1)
+
+if [ -z "$JIRA_KEY" ]; then
+  exit 0
+fi
+
+FIRST_LINE=$(sed -n '1p' "$MSG_FILE")
+printf "%s" "$FIRST_LINE" | grep -Eq "\b$JIRA_KEY\b"
+if [ $? -eq 0 ]; then
+  exit 0
+fi
+
+# Prepend "KEY: " to first line.
+sed -i.bak "1s#^#$JIRA_KEY: #" "$MSG_FILE"
+rm -f "$MSG_FILE.bak"

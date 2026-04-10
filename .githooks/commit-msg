@@ -1,0 +1,17 @@
+#!/bin/sh
+# Enforce Jira key presence in commit messages for auto-linking.
+
+MSG_FILE="$1"
+
+# Allow merge commits.
+if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  exit 0
+fi
+
+grep -Eq '\b[A-Z][A-Z0-9_]*-[0-9]+\b' "$MSG_FILE"
+if [ $? -ne 0 ]; then
+  echo "ERROR: Commit message must include a Jira issue key (e.g., PROJ-123)." >&2
+  exit 1
+fi
+
+exit 0
